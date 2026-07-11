@@ -1,3 +1,4 @@
 snapshots/
+state/
 *.log
 .DS_Store

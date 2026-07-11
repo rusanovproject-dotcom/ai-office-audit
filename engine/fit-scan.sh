@@ -48,9 +48,15 @@ events() {
     | (fromjson? // empty) as $r
     | select(($r.timestamp // "") >= $cutoff)
     | select(($r.isSidechain // false) != true)          # работа субагента — не задача человека
-    | select($cwdf == "" or (($r.cwd // "") | contains($cwdf)))
-    | if ($r.type == "user") and (($r.entrypoint // "none") | IN($HUMAN_ENTRY[]) | not)
-      then {k: "machine"}
+    # Сегментный матч, не голый substring: 'office' не должен ловить 'office-upgrade'.
+    # Оборачиваем и путь, и фильтр в слеши — совпадение только по границе сегмента пути.
+    | select($cwdf == "" or (("/" + ($r.cwd // "") + "/") | contains("/" + $cwdf + "/")))
+    # Машина/человек решается на уровне СЕССИИ (агрегация ниже выкинет ВСЕ строки машинных сессий,
+    # включая assistant-строки с tool_use). entrypoint sdk-*/headless — это бот/CI/крон.
+    # ОТСУТСТВИЕ entrypoint трактуем консервативно как человека: часть клиентов его не шлёт, а
+    # пометка machine обнулила бы всю реальную историю такого пользователя (хуже редкого шума).
+    | if ($r.type == "user") and (($r.entrypoint // "") != "") and ($r.entrypoint | IN($HUMAN_ENTRY[]) | not)
+      then {k: "machine", s: ($r.sessionId // "")}
       else
     ($r.message.content // null) as $c
 
@@ -79,7 +85,11 @@ events() {
               or (. | test("^Caveat:"))) then empty
         else
           {k: "prompt", s: ($r.sessionId // ""), ts: $r.timestamp, cwd: ($r.cwd // ""),
-           text: ($text | gsub("<system-reminder>[\\s\\S]*?</system-reminder>"; "") | .[0:$maxtext])}
+           # Control-символы U+0000..U+001F в тексте роняют строгий downstream-jq
+           # («control characters must be escaped»). jq-regex \u00xx их не ловит, поэтому
+           # чистим по кодпоинтам через explode: всё < 32 (вкл. \n \t) → пробел.
+           text: ($text | gsub("<system-reminder>[\\s\\S]*?</system-reminder>"; "")
+                  | explode | map(if . < 32 then 32 else . end) | implode | .[0:$maxtext])}
         end
       elif $r.type == "assistant" and (($c | type) == "array") then
         $c[] | select(.type == "tool_use")
@@ -94,10 +104,17 @@ events | jq -s -c '
   # Служебные команды Claude Code: управление сессией, а не вызов инструмента.
   ["clear","model","compact","login","logout","effort","rename","help","config","statusline",
    "fast","resume","exit","doctor","init","cost","status","vim","memory","plugin","agents","export"] as $CTL
-  | (map(select(.k == "prompt" and (.text | test("^\\s*$") | not)))) as $prompts
-  | (map(select(.k == "tool"))) as $tools
-  | (map(select(.k == "slash"))) as $slash
-  | (map(select(.k == "machine")) | length) as $machine
+  # Множество машинных сессий: где встретилась хоть одна machine-строка (нечеловеческий entrypoint).
+  # ВСЕ строки этих сессий (в т.ч. assistant/tool_use) — активность бота, не работа человека.
+  | (map(select(.k == "machine"))) as $machine_rows
+  | ($machine_rows | map(.s) | unique) as $mset
+  | (map(select(.k == "prompt" and (.text | test("^\\s*$") | not) and (.s as $s | ($s | IN($mset[])) | not)))) as $prompts
+  | (map(select(.k == "tool" and (.s as $s | ($s | IN($mset[])) | not)))) as $tools
+  | (map(select(.k == "slash" and (.s as $s | ($s | IN($mset[])) | not)))) as $slash
+  # excluded = машинные user-строки + любые tool/slash/prompt-строки машинных сессий (их тоже выкинули),
+  # чтобы фраза «машинные прогоны отсечены» была правдой и по tool-метрикам.
+  | (($machine_rows | length)
+     + (map(select((.k == "tool" or .k == "slash" or .k == "prompt") and (.s as $s | ($s | IN($mset[]))))) | length)) as $machine
   | {
       window_days: '"$DAYS"',
       sessions: ([($prompts[] | .s), ($slash[] | .s)] | unique | length),

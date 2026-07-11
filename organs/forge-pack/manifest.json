@@ -1,0 +1,26 @@
+{
+  "organ_id": "forge-pack",
+  "type": "skill-pack",
+  "human_name": "Кузница — цикл разработки (TDD + ревью)",
+  "source": {
+    "local": "~/forge-pack",
+    "git": "https://github.com/rusanovproject-dotcom/forge-pack.git"
+  },
+  "installs_to": "skills/forge",
+  "required_files": ["SKILL.md", "references/code-cycle.md", "references/swarm.md"],
+  "required_plugins": [
+    {
+      "grep": "superpowers@",
+      "install_hint": "/plugin marketplace add obra/superpowers-marketplace && /plugin install superpowers@superpowers-marketplace"
+    },
+    {
+      "grep": "compound-engineering@",
+      "install_hint": "/plugin marketplace add EveryInc/compound-engineering-plugin && /plugin install compound-engineering@compound-engineering-plugin"
+    }
+  ],
+  "routing_block_marker": "через `/forge`",
+  "first_task": {
+    "suggestion": "дай forge тривиальную задачу (правка одной строки) и проверь, что Шаг 0 классификатор честно скажет «просто Edit, цикл не нужен»",
+    "why": "это доказывает, что скилл читается и preflight находит зависимости"
+  }
+}

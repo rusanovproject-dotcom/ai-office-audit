@@ -145,6 +145,92 @@ setup() {
   [ "$(jq -r '.manual_sessions' <<< "$out")" -eq 1 ]
 }
 
+# CRIT-2. Машинная сессия (человек не печатал, entrypoint=sdk-*) несёт tool_use-строки
+# (Bash/Skill от бота/SDK/крона). Раньше machine-фильтр глушил только user-строки, а
+# assistant-строки с tool_use текли в метрики → «100% робота подано как работа человека».
+# Решение на уровне СЕССИИ: все строки машинной сессии (в т.ч. tool_use) выкинуть.
+@test "machine session: assistant tool rows excluded, not counted as human work" {
+  fix="$BATS_TEST_TMPDIR/machtoolproj"; mkdir -p "$fix/p"
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"sessionId\":\"bot\",\"timestamp\":\"$ts\",\"message\":{\"content\":\"смоук-прогон бота\"}}" \
+    "{\"type\":\"assistant\",\"sessionId\":\"bot\",\"timestamp\":\"$ts\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}]}}" \
+    "{\"type\":\"assistant\",\"sessionId\":\"bot\",\"timestamp\":\"$ts\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{}}]}}" \
+    > "$fix/p/s.jsonl"
+  out="$(bash "$SCAN" --transcripts "$fix" --days 30)"
+  [ "$(jq -r '.tooled_sessions' <<< "$out")" -eq 0 ]
+  [ "$(jq -r '.manual_ops' <<< "$out")" -eq 0 ]
+  [ "$(jq -r '.tooled_ops' <<< "$out")" -eq 0 ]
+  [ "$(jq -r '.manual_sessions' <<< "$out")" -eq 0 ]
+  # excluded_machine_rows учитывает и выкинутые tool-строки: 1 user + 2 tool = 3
+  [ "$(jq -r '.excluded_machine_rows' <<< "$out")" -eq 3 ]
+}
+
+# Машинные строки давят только машинную сессию — работа живого человека рядом остаётся целой.
+@test "mixed batch: human-session tools kept, machine-session tools dropped" {
+  fix="$BATS_TEST_TMPDIR/mixtoolproj"; mkdir -p "$fix/p"
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"entrypoint\":\"cli\",\"sessionId\":\"live\",\"timestamp\":\"$ts\",\"message\":{\"content\":\"собери лендинг\"}}" \
+    "{\"type\":\"assistant\",\"sessionId\":\"live\",\"timestamp\":\"$ts\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{}}]}}" \
+    "{\"type\":\"user\",\"entrypoint\":\"sdk-py\",\"sessionId\":\"bot\",\"timestamp\":\"$ts\",\"message\":{\"content\":\"крон-прогон\"}}" \
+    "{\"type\":\"assistant\",\"sessionId\":\"bot\",\"timestamp\":\"$ts\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}]}}" \
+    > "$fix/p/s.jsonl"
+  out="$(bash "$SCAN" --transcripts "$fix" --days 30)"
+  [ "$(jq -r '.sessions' <<< "$out")" -eq 1 ]
+  [ "$(jq -r '.tooled_ops' <<< "$out")" -eq 1 ]
+  [ "$(jq -r '.tooled_sessions' <<< "$out")" -eq 1 ]
+  [ "$(jq -r '.manual_ops' <<< "$out")" -eq 0 ]
+}
+
+# MED-8. Управляющий символ U+0000..U+001F в тексте промпта роняет downstream-jq
+# («control characters must be escaped»). Фикстура несёт  внутри промпта —
+# после fromjson это реальный control-символ. Вывод обязан парситься и не нести контрол-символов.
+@test "control chars in prompt text are sanitized to keep output valid json" {
+  fix="$BATS_TEST_TMPDIR/ctrlproj"; mkdir -p "$fix/p"
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"entrypoint\":\"cli\",\"sessionId\":\"s1\",\"timestamp\":\"$ts\",\"message\":{\"content\":\"промпт с \\u0001 контрол-символом внутри\"}}" \
+    > "$fix/p/s.jsonl"
+  out="$(bash "$SCAN" --transcripts "$fix" --days 30)"
+  jq -e . <<< "$out" >/dev/null
+  [ "$(jq -r '.human_prompts | length' <<< "$out")" -eq 1 ]
+  # Инвариант: само значение .text не несёт ни одного control-кодпоинта U+0000..U+001F.
+  # Именно он гарантирует валидный вывод на ЛЮБОМ jq (старые версии эмитят сырой байт).
+  # jq-regex \u00xx их не ловит, поэтому берём сырое значение и считаем control-байты.
+  raw="$(jq -r '.human_prompts[0].text' <<< "$out")"
+  n="$(printf '%s' "$raw" | LC_ALL=C tr -cd '\000-\037' | wc -c | tr -d ' ')"
+  [ "$n" -eq 0 ]
+}
+
+# MED-7. --cwd-filter должен матчить сегмент пути, а не голый substring:
+# 'office' не смеет ловить '/x/office-upgrade' (иначе подмешаются чужие сессии).
+@test "cwd-filter matches path segment, not bare substring" {
+  fix="$BATS_TEST_TMPDIR/cwdproj"; mkdir -p "$fix/p"
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"entrypoint\":\"cli\",\"sessionId\":\"s1\",\"cwd\":\"/x/office-upgrade\",\"timestamp\":\"$ts\",\"message\":{\"content\":\"работа в office-upgrade\"}}" \
+    > "$fix/p/s.jsonl"
+  out="$(bash "$SCAN" --transcripts "$fix" --days 30 --cwd-filter office)"
+  [ "$(jq -r '.human_prompts | length' <<< "$out")" -eq 0 ]
+  out2="$(bash "$SCAN" --transcripts "$fix" --days 30 --cwd-filter office-upgrade)"
+  [ "$(jq -r '.human_prompts | length' <<< "$out2")" -eq 1 ]
+}
+
+# user-строка БЕЗ поля entrypoint: консервативно считаем человеком, а не молча душим как machine.
+# На машине Никиты entrypoint есть всегда, но другой клиент может его не слать — тогда пометка
+# machine обнулила бы ВСЮ реальную историю человека (страшнее, чем редкий машинный шум).
+@test "user row without entrypoint is treated as human, not silently machine-dropped" {
+  fix="$BATS_TEST_TMPDIR/noentproj"; mkdir -p "$fix/p"
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"sessionId\":\"s1\",\"timestamp\":\"$ts\",\"message\":{\"content\":\"строка без поля entrypoint\"}}" \
+    > "$fix/p/s.jsonl"
+  out="$(bash "$SCAN" --transcripts "$fix" --days 30)"
+  [ "$(jq -r '.human_prompts | length' <<< "$out")" -eq 1 ]
+  [ "$(jq -r '.excluded_machine_rows' <<< "$out")" -eq 0 ]
+}
+
 @test "broken json line does not crash engine" {
   run bash "$SCAN" --transcripts "$FIX" --days 30
   [ "$status" -eq 0 ]
