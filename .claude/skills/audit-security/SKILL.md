@@ -23,6 +23,30 @@ allowed-tools: Read, Grep, Glob, Bash(engine/*.sh:*), Bash(jq:*), Bash(wc:*), Ba
 read-only утилиты. Любая правка чужого офиса — отдельный, явно одобренный шаг через **Протокол
 безопасности** ниже, не «по ходу».
 
+## Шаг 0 — корень пака (ОБЯЗАТЕЛЬНО перед любым `engine/*.sh`)
+
+Движок лежит в `engine/` в корне пака. Запусти это ПЕРВЫМ — оно найдёт ДОВЕРЕННЫЙ корень (твой клон
+`ai-office-audit`) и перейдёт в него; дальше все `engine/*.sh` идут относительным путём как есть.
+Запускай `/audit-*` **из папки клона** (как в README) — НЕ из каталога проверяемого офиса: движок
+берётся только из доверенного клона, чужой офис источником движка быть не может. Read-only, ничего не пишет.
+```bash
+# --- ai-office-audit: находим ДОВЕРЕННЫЙ корень пака (где engine/); CWD чужого офиса не доверяем ---
+PACK_ROOT=""
+if [ -f "$HOME/ai-office-audit/.ai-office-audit" ]; then PACK_ROOT="$HOME/ai-office-audit"; fi
+if [ -z "$PACK_ROOT" ]; then _d="$PWD"; while [ "$_d" != "/" ]; do
+  if [ -f "$_d/.ai-office-audit" ]; then
+    case "$(git -C "$_d" config --get remote.origin.url 2>/dev/null)" in
+      */ai-office-audit|*/ai-office-audit.git|*/ai-office-audit/) PACK_ROOT="$_d" ;;
+    esac
+    break
+  fi
+  _d="$(dirname "$_d")"
+done; fi
+if [ -z "$PACK_ROOT" ]; then echo 'ai-office-audit: доверенный корень пака не найден — склонируй ОФИЦИАЛЬНЫЙ репо и запусти /audit-* из его папки (README). Из каталога проверяемого офиса не запускай.' >&2; exit 1; fi
+cd "$PACK_ROOT" && echo "pack root: $PACK_ROOT"
+```
+Ошибка «корень не найден» → ты не в клоне (или клон не там). Скажи пользователю запустить из папки клона `ai-office-audit`, не выдумывай путь. **`--target` всегда указывай АБСОЛЮТНЫМ путём** (после cd относительный `--target` укажет на сам пак → ложно-чистый отчёт).
+
 Движок под тобой (в этом репо), READ-ONLY, JSON в stdout:
 ```
 engine/secret-scan.sh --target <офис> --transcripts <его ~/.claude/projects> [--zones transcripts,git,rights]
